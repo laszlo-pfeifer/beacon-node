@@ -19,7 +19,7 @@ type LogRecord = {
   span_id?: string
   parent_span_id?: string
   duration_ms?: number
-  attributes?: Record<string, any>
+  attributes?: Record<string, unknown>
   // attributes: {
   //   statusCode: reply.statusCode.toString(),
   //   method: req.method,
@@ -37,7 +37,7 @@ export const sendLog = async (logRecord: LogRecord) => {
     //   JSON.stringify(logRecord),
     // )
     // Here you would send
-    const res = await fetch(`${BASE_URL}/logs`, {
+    await fetch(`${BASE_URL}/logs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(logRecord),
@@ -49,7 +49,7 @@ export const sendLog = async (logRecord: LogRecord) => {
   }
 }
 
-export const runInSpan = (cb: () => Promise<any>) => {
+export const runInSpan = (cb: () => Promise<unknown>) => {
   executionContext.run(
     {
       traceId: executionContext.getStore()?.traceId || randomUUID(),
@@ -60,7 +60,10 @@ export const runInSpan = (cb: () => Promise<any>) => {
   )
 }
 
-export const logInfo = (message: string, extra: Record<string, any> = {}) => {
+export const logInfo = (
+  message: string,
+  extra: Record<string, unknown> = {}
+) => {
   const { duration_ms, ...attributes } = extra
   sendLog({
     timestamp: new Date().toISOString(),
@@ -73,7 +76,10 @@ export const logInfo = (message: string, extra: Record<string, any> = {}) => {
     attributes,
   })
 }
-export const logWarn = (message: string, extra: Record<string, any> = {}) => {
+export const logWarn = (
+  message: string,
+  extra: Record<string, unknown> = {}
+) => {
   const { duration_ms, ...attributes } = extra
   sendLog({
     timestamp: new Date().toISOString(),
@@ -86,7 +92,10 @@ export const logWarn = (message: string, extra: Record<string, any> = {}) => {
     attributes,
   })
 }
-export const logError = (message: string, extra: Record<string, any> = {}) => {
+export const logError = (
+  message: string,
+  extra: Record<string, unknown> = {}
+) => {
   const { duration_ms, ...attributes } = extra
   sendLog({
     timestamp: new Date().toISOString(),
@@ -132,7 +141,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
       traceId,
       spanId,
       start,
-      logs: [] as any[],
+      logs: [] as unknown[],
     }
 
     sendLog({
