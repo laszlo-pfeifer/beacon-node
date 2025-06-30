@@ -1,0 +1,10 @@
+# Add files here to ignore them from prettier formatting
+
+/dist
+/coverage
+node_modules
+tmp
+pnpm-lock.yaml
+/.nx
+.idea
+**/routeTree.gen.ts

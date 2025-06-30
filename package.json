@@ -1,0 +1,66 @@
+{
+  "name": "beacon-node",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Zero-config instrumentation and logging for Beacon observability platform.",
+  "keywords": [
+    "logging",
+    "instrumentation",
+    "observability",
+    "beacon",
+    "saas"
+  ],
+  "homepage": "https://beacon.example.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/laszlo-pfeifer/beacon-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/laszlo-pfeifer/beacon-node/issues"
+  },
+  "license": "MIT",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run test && npm run lint"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.6",
+    "@rollup/plugin-node-resolve": "^16.0.1",
+    "@rollup/plugin-typescript": "^12.1.3",
+    "@types/node": "^24.0.7",
+    "eslint": "^8.57.1",
+    "rollup": "^4.44.1",
+    "rollup-plugin-dts": "^6.2.1",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3",
+    "vitest": "^1.6.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "fastify": "^5.4.0",
+    "fastify-plugin": "^5.0.1"
+  }
+}

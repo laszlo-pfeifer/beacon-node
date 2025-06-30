@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+      "target": "ES2021",                      // Modern Node
+      "module": "NodeNext",                      // Output ESM for bundler
+      "moduleResolution": "NodeNext",          // Node ESM/CJS hybrid
+      "declaration": true,                     // Emit .d.ts files for consumers
+      "declarationMap": true,
+      "outDir": "dist",                        // Output folder for builds
+      "strict": true,                          // All type-safety on
+      "esModuleInterop": true,                  // Best compatibility for CJS/ESM
+      "skipLibCheck": true,                     // Faster builds, npm-friendly
+      "forceConsistentCasingInFileNames": true,
+      "importHelpers": false,                   // Usually not needed unless using tslib
+      "sourceMap": true,                        // Helpful for debugging
+      "types": ["node"],                              // Empty means use default Node/types
+      "allowSyntheticDefaultImports": true,
+      "resolveJsonModule": true,
+      "useDefineForClassFields": true,
+      "lib": [
+        "ESNext"
+      ],
+    },
+    "include": [
+      "src/**/*"
+    ],
+    "exclude": [
+      "dist",
+      "node_modules",
+      "test",
+      "**/*.test.ts"
+    ]
+  }
+  
