@@ -2,7 +2,7 @@
 import { randomUUID } from 'crypto'
 import fp from 'fastify-plugin'
 import { AsyncLocalStorage } from 'async_hooks'
-import { FastifyPluginAsync } from 'fastify'
+import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 
 const executionContext = new AsyncLocalStorage<{
   traceId: string
@@ -110,7 +110,8 @@ export const logError = (
 }
 
 export interface MyPluginOptions {
-  myPluginOption?: string
+  onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void // Callback to be called on request
+  onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void // Callback to be called on reply
 }
 
 const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
@@ -118,7 +119,8 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
   options
 ) => {
   fastify.decorateRequest('logContext', 'super_secret_value')
-  fastify.decorateReply('myPluginProp', options.myPluginOption)
+  fastify.decorateRequest('onRequestCallback', options.onRequestCallback)
+  fastify.decorateReply('onReplyCallback', options.onReplyCallback)
 
   fastify.addHook('preHandler', (request, _reply, next) => {
     // Use executionContext to
@@ -133,6 +135,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
     //   } at ${new Date().toISOString()}`
     // )
     // console.log(executionContext.getStore(), 'executionContext.getStore()')
+    req.onRequestCallback?.call(req, req, reply)
     const traceId = executionContext.getStore()?.traceId || randomUUID()
     const spanId = executionContext.getStore()?.spanId || randomUUID()
     const start = process.hrtime.bigint()
@@ -163,6 +166,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
     const { traceId, spanId, start } = req.logContext || {}
     const durationMs = Number(process.hrtime.bigint() - start) / 1e6
     // Send logs to your logging backend
+    reply.onReplyCallback?.call(req, req, reply)
     sendLog({
       timestamp: new Date().toISOString(),
       severity: 'INFO',
