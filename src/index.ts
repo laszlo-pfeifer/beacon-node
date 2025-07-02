@@ -34,7 +34,7 @@ export const sendLog = async (logRecord: LogRecord) => {
   try {
     // Here you would send
     console.log('BEACON_URL', BASE_URL)
-    if (!BASE_URL || BASE_URL === '' || BASE_URL === 'undefined') {
+    if (BASE_URL && BASE_URL !== '' && BASE_URL !== 'undefined') {
       console.log(
         `Sending log for ${logRecord.trace_id}:`,
         JSON.stringify(logRecord)
