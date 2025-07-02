@@ -1,6 +1,6 @@
 {
   "name": "beacon-node",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "type": "module",
   "description": "Zero-config instrumentation and logging for Beacon observability platform.",
   "keywords": [
