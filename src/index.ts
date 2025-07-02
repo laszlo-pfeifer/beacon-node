@@ -37,7 +37,7 @@ export const sendLog = async (logRecord: LogRecord) => {
     //   JSON.stringify(logRecord),
     // )
     // Here you would send
-    if (!BASE_URL) {
+    if (!BASE_URL || BASE_URL === '' || BASE_URL === 'undefined') {
       await fetch(`${BASE_URL}/logs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
