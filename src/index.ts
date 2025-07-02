@@ -33,6 +33,7 @@ const BASE_URL = process.env['BEACON_URL']
 export const sendLog = async (logRecord: LogRecord) => {
   try {
     // Here you would send
+    console.log('BEACON_URL', BASE_URL)
     if (!BASE_URL || BASE_URL === '' || BASE_URL === 'undefined') {
       console.log(
         `Sending log for ${logRecord.trace_id}:`,
@@ -137,7 +138,6 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
     //   } at ${new Date().toISOString()}`
     // )
     // console.log(executionContext.getStore(), 'executionContext.getStore()')
-    req.onRequestCallback?.call(req, req, reply)
     const traceId = executionContext.getStore()?.traceId || randomUUID()
     const spanId = executionContext.getStore()?.spanId || randomUUID()
     const start = process.hrtime.bigint()
@@ -162,13 +162,13 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
         path: req.params?.path || '',
       },
     })
+    req.onRequestCallback?.call(req, req, reply)
   })
 
   fastify.addHook('onResponse', async (req, reply) => {
     const { traceId, spanId, start } = req.logContext || {}
     const durationMs = Number(process.hrtime.bigint() - start) / 1e6
     // Send logs to your logging backend
-    reply.onReplyCallback?.call(req, req, reply)
     sendLog({
       timestamp: new Date().toISOString(),
       severity: 'INFO',
@@ -183,6 +183,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
         path: req.params?.path || '',
       },
     })
+    reply.onReplyCallback?.call(req, req, reply)
   })
 }
 
