@@ -33,19 +33,19 @@ const BASE_URL = process.env['BEACON_URL']
 export const sendLog = async (logRecord: LogRecord) => {
   try {
     // Here you would send
-    console.log('BEACON_URL', BASE_URL)
+    // console.log('BEACON_URL', BASE_URL)
     if (BASE_URL && BASE_URL !== '' && BASE_URL !== 'undefined') {
-      console.log(
-        `Sending log for ${logRecord.trace_id}:`,
-        JSON.stringify(logRecord)
-      )
-      const res = await fetch(`${BASE_URL}/logs`, {
+      //   console.log(
+      //     `Sending log for ${logRecord.trace_id}:`,
+      //     JSON.stringify(logRecord)
+      //   )
+      await fetch(`${BASE_URL}/logs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(logRecord),
       })
-      console.log(res.status, await res.text())
-      console.log(res)
+      //   console.log(res.status, await res.text())
+      //   console.log(res)
     }
   } catch (error) {
     console.error(`Failed to send logs for ${logRecord.trace_id}:`, error)
