@@ -28,7 +28,7 @@ type LogRecord = {
   // },
 }
 
-const BASE_URL = process.env['BEACON_URL'] ?? 'http://localhost:8080'
+const BASE_URL = process.env['BEACON_URL']
 
 export const sendLog = async (logRecord: LogRecord) => {
   try {
@@ -37,11 +37,13 @@ export const sendLog = async (logRecord: LogRecord) => {
     //   JSON.stringify(logRecord),
     // )
     // Here you would send
-    await fetch(`${BASE_URL}/logs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(logRecord),
-    })
+    if (!BASE_URL) {
+      await fetch(`${BASE_URL}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(logRecord),
+      })
+    }
     // console.log(res.status, await res.text())
     // console.log(res)
   } catch (error) {
