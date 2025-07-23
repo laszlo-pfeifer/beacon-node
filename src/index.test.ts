@@ -283,8 +283,8 @@ describe('Enhanced Beacon Server Integration', () => {
           event_type: 'db',
           message: 'Test',
           trace_info: {
-            db_table_name: 123 as any,
-            db_error_code: true as any,
+            db_table_name: 123 as unknown as string,
+            db_error_code: true as unknown as string,
           },
         }
         const result = validateLogEvent(event)
@@ -875,13 +875,13 @@ describe('Enhanced Beacon Server Integration', () => {
     })
 
     test('should skip beacon when _beacon_skip is true', () => {
-      const originalSendLog = sendLog
       let logsSent = 0
 
       // Mock sendLog to count calls
-      ;(global as any).sendLogMock = async (logEvent: LogEvent) => {
-        logsSent++
-      }
+      ;(global as unknown as Record<string, unknown>).sendLogMock =
+        async () => {
+          logsSent++
+        }
 
       // Test normal log (should be sent)
       logInfo('Normal log message')
