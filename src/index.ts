@@ -327,6 +327,7 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
   // Enhanced database event tracking with comprehensive metadata
   const addDbEvent = (
     traceId: string,
+    spanId: string, // Accept spanId as parameter
     query: string,
     durationMs: number,
     rowsAffected?: number,
@@ -343,20 +344,28 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
   ): LogEvent => {
     const trace = activeTraces.get(traceId)
 
+    // TODO: Using query in message only works for this test project because it uses tRPC.
+    // In production, consider using a more generic message or sanitizing the query.
+    const message = dbMetadata?.errorCode
+      ? `Database query failed: ${query.substring(0, 50)}${
+          query.length > 50 ? '...' : ''
+        }`
+      : `Database query completed: ${query.substring(0, 50)}${
+          query.length > 50 ? '...' : ''
+        }`
+
     const event: LogEvent = {
       event_type: 'db',
-      message: dbMetadata?.errorCode
-        ? 'Database operation failed'
-        : 'Database operation completed',
+      message,
       severity: dbMetadata?.errorCode ? 'error' : 'info',
       trace_id: traceId,
-      span_id: `db-${Date.now()}`,
+      span_id: spanId,
       trace_info: {
         db_query:
           config.enableValidation && isValidDbQuery(query)
             ? query
             : query.substring(0, 100) + '...',
-        db_duration_ms: durationMs,
+        db_duration_ms: Math.round(durationMs),
         db_rows_affected: rowsAffected,
         db_query_type: dbMetadata?.queryType,
         db_table_name: dbMetadata?.tableName,
@@ -380,8 +389,7 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
     traceId: string,
     spanId: string,
     statusCode: number,
-    durationMs: number,
-    customFields?: Record<string, unknown>
+    durationMs: number
   ): LogEvent | null => {
     const trace = activeTraces.get(traceId)
     if (!trace) return null
@@ -400,7 +408,6 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
           ? statusCode
           : undefined,
         http_duration_ms: Math.round(durationMs),
-        custom_fields: customFields,
       },
     }
 
@@ -453,23 +460,66 @@ const sendWithRetry = async (
   retryCount = 0
 ): Promise<void> => {
   try {
+    if (debugLogging) {
+      console.log(`🌐 Sending request to ${url}`, {
+        method: options.method,
+        retryCount,
+        body: options.body ? JSON.parse(options.body as string) : null,
+      })
+    }
+
     const response = await fetch(url, options)
 
+    if (debugLogging) {
+      console.log(`📡 Server response from ${url}:`, {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok,
+        headers: Object.fromEntries(response.headers.entries()),
+      })
+    }
+
     if (response.ok) {
+      if (debugLogging) {
+        const responseText = await response.text()
+        console.log(`✅ Success response body:`, responseText)
+      }
       return // Success
     }
 
     if (response.status === 400) {
       // Validation error - don't retry, log the error
       const errorText = await response.text()
-      console.error('Validation error from server:', errorText)
+      console.error('❌ Validation error from server:', errorText)
+      if (debugLogging) {
+        console.log('🔍 Full validation error details:', {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorText,
+          url,
+        })
+      }
       return // Don't retry validation errors
     }
 
+    const errorText = await response.text()
+    if (debugLogging) {
+      console.log(`⚠️ Error response body:`, errorText)
+    }
     throw new Error(`HTTP ${response.status}: ${response.statusText}`)
   } catch (error) {
+    if (debugLogging) {
+      console.log(
+        `🔄 Request failed, retry ${retryCount}/${config.maxRetries}:`,
+        error
+      )
+    }
+
     if (retryCount < config.maxRetries) {
       const delay = config.retryDelay * Math.pow(2, retryCount) // Exponential backoff
+      if (debugLogging) {
+        console.log(`⏳ Retrying in ${delay}ms...`)
+      }
       await new Promise((resolve) => setTimeout(resolve, delay))
       return sendWithRetry(url, options, config, retryCount + 1)
     }
@@ -656,6 +706,15 @@ process.on('SIGINT', async () => {
 // ====== PUBLIC API ======
 
 export const sendLog = async (logEvent: LogEvent): Promise<void> => {
+  if (debugLogging) {
+    console.log('🚀 Sending log to Beacon Server:', {
+      event_type: logEvent.event_type,
+      message: logEvent.message,
+      trace_id: logEvent.trace_id,
+      span_id: logEvent.span_id,
+      timestamp: new Date().toISOString(),
+    })
+  }
   await globalBatcher.addLog(logEvent)
 }
 
@@ -676,12 +735,8 @@ export const runInSpan = async (
 const createLogEvent = (
   event_type: LogEvent['event_type'],
   severity: LogEvent['severity'],
-  message: string,
-  extra: Record<string, unknown> = {}
+  message: string
 ): LogEvent => {
-  const { duration_ms, trace_info, ...customFields } = extra
-  const durationMs = typeof duration_ms === 'number' ? duration_ms : undefined
-
   return {
     event_type,
     severity,
@@ -689,13 +744,6 @@ const createLogEvent = (
     trace_id: executionContext.getStore()?.traceId,
     span_id: executionContext.getStore()?.spanId,
     parent_span_id: executionContext.getStore()?.parentSpanId,
-    trace_info: {
-      ...(trace_info as TraceInfo),
-      ...(durationMs && { http_duration_ms: Math.round(durationMs) }),
-      ...(Object.keys(customFields).length > 0 && {
-        custom_fields: customFields,
-      }),
-    },
   }
 }
 
@@ -703,35 +751,45 @@ export const logInfo = (
   message: string,
   extra: Record<string, unknown> = {}
 ): void => {
-  sendLog(createLogEvent('log', 'info', message, extra))
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+  sendLog(createLogEvent('log', 'info', message))
 }
 
 export const logWarn = (
   message: string,
   extra: Record<string, unknown> = {}
 ): void => {
-  sendLog(createLogEvent('log', 'warn', message, extra))
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+  sendLog(createLogEvent('log', 'warn', message))
 }
 
 export const logError = (
   message: string,
   extra: Record<string, unknown> = {}
 ): void => {
-  sendLog(createLogEvent('log', 'error', message, extra))
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+  sendLog(createLogEvent('log', 'error', message))
 }
 
 export const logDebug = (
   message: string,
   extra: Record<string, unknown> = {}
 ): void => {
-  sendLog(createLogEvent('log', 'debug', message, extra))
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+  sendLog(createLogEvent('log', 'debug', message))
 }
 
 export const logFatal = (
   message: string,
   extra: Record<string, unknown> = {}
 ): void => {
-  sendLog(createLogEvent('log', 'fatal', message, extra))
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+  sendLog(createLogEvent('log', 'fatal', message))
 }
 
 // Enhanced DB logging function with comprehensive metadata support
@@ -751,18 +809,39 @@ export const logDbOperation = (
   },
   extra: Record<string, unknown> = {}
 ): void => {
+  const { _beacon_skip } = extra
+  if (_beacon_skip === true) return
+
+  if (debugLogging) {
+    console.log('📊 logDbOperation called:', {
+      query: query.substring(0, 50) + (query.length > 50 ? '...' : ''),
+      durationMs,
+      metadata,
+      trace_id: executionContext.getStore()?.traceId,
+      span_id: executionContext.getStore()?.spanId,
+    })
+  }
+
+  // TODO: Using query in message only works for this test project because it uses tRPC.
+  // In production, consider using a more generic message or sanitizing the query.
+  const message = metadata?.errorCode
+    ? `Database query failed: ${query.substring(0, 50)}${
+        query.length > 50 ? '...' : ''
+      }`
+    : `Database query completed: ${query.substring(0, 50)}${
+        query.length > 50 ? '...' : ''
+      }`
+
   const event: LogEvent = {
     event_type: 'db',
     severity: metadata?.errorCode ? 'error' : 'info',
-    message: metadata?.errorCode
-      ? 'Database operation failed'
-      : 'Database operation completed',
+    message,
     trace_id: executionContext.getStore()?.traceId,
-    span_id: executionContext.getStore()?.spanId,
+    span_id: executionContext.getStore()?.spanId || randomUUID(),
     parent_span_id: executionContext.getStore()?.parentSpanId,
     trace_info: {
       db_query: query,
-      db_duration_ms: durationMs,
+      db_duration_ms: Math.round(durationMs),
       db_rows_affected: rowsAffected,
       db_query_type: metadata?.queryType,
       db_table_name: metadata?.tableName,
@@ -778,7 +857,23 @@ export const logDbOperation = (
   sendLog(event)
 }
 
-// Trace management API
+// ====== DEBUG HELPERS ======
+
+// Debug flag for troubleshooting
+let debugLogging = false
+
+export const enableDebugLogging = (): void => {
+  debugLogging = true
+  console.log('🔍 Beacon Debug Logging Enabled')
+}
+
+export const disableDebugLogging = (): void => {
+  debugLogging = false
+  console.log('🔍 Beacon Debug Logging Disabled')
+}
+
+// ====== PUBLIC API ======
+
 export const startHttpTrace = (
   traceId: string,
   spanId: string,
@@ -816,6 +911,7 @@ export const addTraceLog = (
 // Enhanced database event with comprehensive metadata
 export const addTraceDbEvent = (
   traceId: string,
+  spanId: string, // Accept spanId as parameter
   query: string,
   durationMs: number,
   rowsAffected?: number,
@@ -832,6 +928,7 @@ export const addTraceDbEvent = (
 ): void => {
   const event = globalTraceManager.addDbEvent(
     traceId,
+    spanId,
     query,
     durationMs,
     rowsAffected,
@@ -844,15 +941,13 @@ export const endHttpTrace = (
   traceId: string,
   spanId: string,
   statusCode: number,
-  durationMs: number,
-  customFields?: Record<string, unknown>
+  durationMs: number
 ): void => {
   const event = globalTraceManager.endHttpTrace(
     traceId,
     spanId,
     statusCode,
-    durationMs,
-    customFields
+    durationMs
   )
   if (event) {
     sendLog(event)
@@ -885,6 +980,7 @@ declare module 'fastify' {
 export type MyPluginOptions = {
   onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void
   onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void
+  excludePaths?: string[] // Paths to exclude from trace logging
 }
 
 const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
@@ -910,6 +1006,23 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
   fastify.decorateRequest('onRequestCallback', options.onRequestCallback)
   fastify.decorateReply('onReplyCallback', options.onReplyCallback)
 
+  // Helper function to check if path should be excluded
+  const shouldExcludePath = (path: string): boolean => {
+    if (!options.excludePaths || options.excludePaths.length === 0) {
+      return false
+    }
+
+    const normalizedPath = path.split('?')[0] // Remove query params for matching
+    return options.excludePaths.some((excludePath) => {
+      // Support exact match and wildcard patterns
+      if (excludePath.endsWith('*')) {
+        const prefix = excludePath.slice(0, -1)
+        return normalizedPath.startsWith(prefix)
+      }
+      return normalizedPath === excludePath
+    })
+  }
+
   fastify.addHook('onRequest', async (req, reply) => {
     const traceId = randomUUID()
     const spanId = randomUUID()
@@ -922,15 +1035,18 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
       logs: [],
     }
 
-    // Always use enhanced HTTP trace logging
-    startHttpTrace(
-      traceId,
-      spanId,
-      req.method,
-      req.url.split('?')[0],
-      req.headers['user-agent'],
-      req.ip
-    )
+    // Check if this path should be excluded from trace logging
+    if (!shouldExcludePath(req.url)) {
+      // Use enhanced HTTP trace logging for non-excluded paths
+      startHttpTrace(
+        traceId,
+        spanId,
+        req.method,
+        req.url.split('?')[0],
+        req.headers['user-agent'],
+        req.ip
+      )
+    }
 
     req.onRequestCallback?.(req, reply)
   })
@@ -949,11 +1065,10 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
 
     const durationMs = Number(process.hrtime.bigint() - start) / 1e6
 
-    // Always use enhanced HTTP trace completion
-    endHttpTrace(traceId, spanId, reply.statusCode, durationMs, {
-      responseTime: `${durationMs.toFixed(2)}ms`,
-      url: req.url,
-    })
+    // Only log trace completion for non-excluded paths
+    if (!shouldExcludePath(req.url)) {
+      endHttpTrace(traceId, spanId, reply.statusCode, durationMs)
+    }
 
     reply.onReplyCallback?.(req, reply)
   })
