@@ -1000,7 +1000,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
     },
     setter(value) {
       // Store the value on the request object
-      ;(this as FastifyRequest)._logContext = value
+      (this as FastifyRequest)._logContext = value
     },
   })
   fastify.decorateRequest('onRequestCallback', options.onRequestCallback)
