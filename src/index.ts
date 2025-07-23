@@ -1,143 +1,919 @@
-// loggerPlugin.ts
+// Beacon Node TypeScript Instrumentation Library
 import { randomUUID } from 'crypto'
 import fp from 'fastify-plugin'
 import { AsyncLocalStorage } from 'async_hooks'
 import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 
-const executionContext = new AsyncLocalStorage<{
+export const executionContext = new AsyncLocalStorage<{
   traceId: string
   spanId: string
   parentSpanId?: string
 }>()
 
-type LogRecord = {
-  timestamp?: string
-  server_id?: string
-  severity: 'TRACE' | 'INFO' | 'DEBUG' | 'WARN' | 'ERROR'
-  message: string
-  trace_id: string
-  span_id?: string
-  parent_span_id?: string
-  duration_ms?: number
-  attributes?: Record<string, unknown>
-  // attributes: {
-  //   statusCode: reply.statusCode.toString(),
-  //   method: req.method,
-  //   url: req.url,
-  //   path: req.params?.path || '',
-  // },
+// Enhanced TraceInfo type for multi-table buffer system with comprehensive DB tracking
+export type TraceInfo = {
+  // HTTP fields
+  http_method?: string
+  http_path?: string // Original path: /api/users/123
+  http_status_code?: number // 100-599 only
+  http_duration_ms?: number
+  http_user_agent?: string
+  http_remote_ip?: string // MUST be valid IP format
+
+  // Database fields - EXPANDED for comprehensive tracking
+  db_query?: string
+  db_duration_ms?: number
+  db_rows_affected?: number
+  db_query_type?: string // SELECT, INSERT, UPDATE, DELETE, etc.
+  db_table_name?: string // Primary table being queried
+  db_database?: string // Database/schema name
+  db_rows_examined?: number // For performance analysis
+  db_error_code?: string // Database error code if failed
+  db_error_message?: string // Error message if failed
+  db_connection_id?: string // Database connection identifier
+  db_transaction_id?: string // Transaction ID
+
+  // Custom fields
+  custom_fields?: Record<string, unknown>
 }
 
-const BASE_URL = process.env['BEACON_URL']
+// Enhanced LogEvent type for beacon-server multi-table support
+export type LogEvent = {
+  event_type: 'log' | 'http' | 'db' // Required
+  message: string // Required
+  severity?: 'debug' | 'info' | 'warn' | 'error' | 'fatal' // Optional (default: info)
+  timestamp?: string // Optional (ISO 8601)
 
-export const sendLog = async (logRecord: LogRecord) => {
-  try {
-    // Here you would send
-    // console.log('BEACON_URL', BASE_URL)
-    if (BASE_URL && BASE_URL !== '' && BASE_URL !== 'undefined') {
-      //   console.log(
-      //     `Sending log for ${logRecord.trace_id}:`,
-      //     JSON.stringify(logRecord)
-      //   )
-      await fetch(`${BASE_URL}/logs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(logRecord),
-      })
-      //   console.log(res.status, await res.text())
-      //   console.log(res)
+  // Optional trace linking
+  trace_id?: string // Optional
+  span_id?: string // Optional
+  parent_span_id?: string // Optional
+
+  // NEW: Enhanced trace information (stored in traces table)
+  trace_info?: TraceInfo // Optional
+}
+
+// Beacon Server response types
+export type BeaconResponse = {
+  status: 'accepted' | 'error'
+  timestamp: string
+  message: string
+}
+
+export type BeaconBatchResponse = BeaconResponse & {
+  total_logs: number
+  valid_logs: number
+  invalid_logs: number
+}
+
+// Configuration for the beacon client - optimized for 5k+ req/min
+type BeaconConfig = {
+  baseUrl: string
+  batchSize: number
+  batchTimeout: number
+  maxRetries: number
+  retryDelay: number
+  enableValidation: boolean
+}
+
+const DEFAULT_CONFIG: BeaconConfig = {
+  baseUrl: process.env['BEACON_URL'] || 'http://localhost:8085',
+  batchSize: 50, // Optimized for 5k+ req/min performance
+  batchTimeout: 5000, // 5 seconds auto-flush as required
+  maxRetries: 3,
+  retryDelay: 1000, // 1 second initial delay
+  enableValidation: true, // MANDATORY validation to prevent batch failures
+}
+
+// ====== VALIDATION FUNCTIONS (Pure Functions) ======
+
+// IP Address Validation - Critical for server acceptance
+export const isValidIP = (ip: string): boolean => {
+  if (!ip || typeof ip !== 'string') return false
+
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
+  if (!ipv4Regex.test(ip)) return false
+
+  return ip.split('.').every((octet) => {
+    const num = parseInt(octet, 10)
+    return num >= 0 && num <= 255 && octet === num.toString()
+  })
+}
+
+// HTTP Status Code Validation - Server enforces 100-599 range
+export const isValidHttpStatus = (status: number): boolean => {
+  return Number.isInteger(status) && status >= 100 && status <= 599
+}
+
+// Path Length Validation - Server enforces ≤2048 chars
+export const isValidPath = (path: string): boolean => {
+  return typeof path === 'string' && path.length > 0 && path.length <= 2048
+}
+
+// Database Query Validation - Prevent oversized queries
+export const isValidDbQuery = (query: string): boolean => {
+  return typeof query === 'string' && query.length > 0 && query.length <= 8192
+}
+
+// Database Query Type Validation
+export const isValidDbQueryType = (queryType: string): boolean => {
+  const validTypes = [
+    'SELECT',
+    'INSERT',
+    'UPDATE',
+    'DELETE',
+    'CREATE',
+    'DROP',
+    'ALTER',
+    'TRUNCATE',
+    'CALL',
+    'EXPLAIN',
+  ]
+  return validTypes.includes(queryType.toUpperCase())
+}
+
+// Enhanced comprehensive event validation for strict server requirements
+export const validateLogEvent = (
+  event: LogEvent
+): { isValid: boolean; errors: string[] } => {
+  const errors: string[] = []
+
+  // Required fields
+  if (!event.event_type || !['log', 'http', 'db'].includes(event.event_type)) {
+    errors.push('event_type must be one of: log, http, db')
+  }
+
+  if (!event.message || typeof event.message !== 'string') {
+    errors.push('message is required and must be a string')
+  }
+
+  // Optional severity validation
+  if (
+    event.severity &&
+    !['debug', 'info', 'warn', 'error', 'fatal'].includes(event.severity)
+  ) {
+    errors.push('severity must be one of: debug, info, warn, error, fatal')
+  }
+
+  // Enhanced trace info validation
+  if (event.trace_info) {
+    const { trace_info } = event
+
+    // HTTP validations
+    if (trace_info.http_remote_ip && !isValidIP(trace_info.http_remote_ip)) {
+      errors.push(`Invalid IP address: ${trace_info.http_remote_ip}`)
     }
-  } catch (error) {
-    console.error(`Failed to send logs for ${logRecord.trace_id}:`, error)
+
+    if (
+      trace_info.http_status_code &&
+      !isValidHttpStatus(trace_info.http_status_code)
+    ) {
+      errors.push(`Invalid HTTP status code: ${trace_info.http_status_code}`)
+    }
+
+    if (trace_info.http_path && !isValidPath(trace_info.http_path)) {
+      errors.push(`Invalid HTTP path: too long or empty`)
+    }
+
+    if (trace_info.http_method && typeof trace_info.http_method !== 'string') {
+      errors.push('http_method must be a string')
+    }
+
+    // Enhanced DB validations
+    if (trace_info.db_query && !isValidDbQuery(trace_info.db_query)) {
+      errors.push('db_query is too long or empty')
+    }
+
+    if (
+      trace_info.db_query_type &&
+      !isValidDbQueryType(trace_info.db_query_type)
+    ) {
+      errors.push('db_query_type must be a valid SQL operation type')
+    }
+
+    if (
+      trace_info.db_duration_ms &&
+      (typeof trace_info.db_duration_ms !== 'number' ||
+        trace_info.db_duration_ms < 0)
+    ) {
+      errors.push('db_duration_ms must be a non-negative number')
+    }
+
+    if (
+      trace_info.db_rows_affected &&
+      (!Number.isInteger(trace_info.db_rows_affected) ||
+        trace_info.db_rows_affected < 0)
+    ) {
+      errors.push('db_rows_affected must be a non-negative integer')
+    }
+
+    if (
+      trace_info.db_rows_examined &&
+      (!Number.isInteger(trace_info.db_rows_examined) ||
+        trace_info.db_rows_examined < 0)
+    ) {
+      errors.push('db_rows_examined must be a non-negative integer')
+    }
+
+    // Duration validations
+    if (
+      trace_info.http_duration_ms &&
+      (typeof trace_info.http_duration_ms !== 'number' ||
+        trace_info.http_duration_ms < 0)
+    ) {
+      errors.push('http_duration_ms must be a non-negative number')
+    }
+
+    // String field validations
+    const stringFields = [
+      'db_table_name',
+      'db_database',
+      'db_error_code',
+      'db_error_message',
+      'db_connection_id',
+      'db_transaction_id',
+    ]
+    stringFields.forEach((field) => {
+      const value = trace_info[field as keyof TraceInfo]
+      if (value && typeof value !== 'string') {
+        errors.push(`${field} must be a string`)
+      }
+    })
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
   }
 }
 
-export const runInSpan = (cb: () => Promise<unknown>) => {
-  executionContext.run(
+// ====== TRACE LIFECYCLE MANAGEMENT ======
+
+type TraceData = {
+  traceId: string
+  startTime: number
+  method?: string
+  path?: string
+  logs: LogEvent[]
+  dbEvents: LogEvent[]
+}
+
+// Functional trace manager using closures
+export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
+  const activeTraces = new Map<string, TraceData>()
+
+  // Pure function to create trace data
+  const createTraceData = (traceId: string): TraceData => ({
+    traceId,
+    startTime: Date.now(),
+    logs: [],
+    dbEvents: [],
+  })
+
+  const startHttpTrace = (
+    traceId: string,
+    method: string,
+    path: string,
+    userAgent?: string,
+    remoteIP?: string
+  ): LogEvent => {
+    const traceData = createTraceData(traceId)
+    traceData.method = method
+    traceData.path = path
+    activeTraces.set(traceId, traceData)
+
+    const event: LogEvent = {
+      event_type: 'http',
+      message: 'HTTP request started',
+      severity: 'info',
+      trace_id: traceId,
+      span_id: `http-start-${Date.now()}`,
+      trace_info: {
+        http_method: method,
+        http_path: path,
+        http_user_agent: userAgent,
+        http_remote_ip:
+          config.enableValidation && remoteIP && isValidIP(remoteIP)
+            ? remoteIP
+            : undefined,
+      },
+    }
+
+    return event
+  }
+
+  const addLog = (
+    traceId: string,
+    message: string,
+    severity: LogEvent['severity'] = 'info',
+    customFields?: Record<string, unknown>
+  ): LogEvent => {
+    const trace = activeTraces.get(traceId)
+
+    const event: LogEvent = {
+      event_type: 'log',
+      message,
+      severity,
+      trace_id: traceId,
+      span_id: `log-${Date.now()}`,
+      trace_info: customFields ? { custom_fields: customFields } : undefined,
+    }
+
+    if (trace) {
+      trace.logs.push(event)
+    }
+
+    return event
+  }
+
+  // Enhanced database event tracking with comprehensive metadata
+  const addDbEvent = (
+    traceId: string,
+    query: string,
+    durationMs: number,
+    rowsAffected?: number,
+    dbMetadata?: {
+      queryType?: string
+      tableName?: string
+      database?: string
+      rowsExamined?: number
+      errorCode?: string
+      errorMessage?: string
+      connectionId?: string
+      transactionId?: string
+    }
+  ): LogEvent => {
+    const trace = activeTraces.get(traceId)
+
+    const event: LogEvent = {
+      event_type: 'db',
+      message: dbMetadata?.errorCode
+        ? 'Database operation failed'
+        : 'Database operation completed',
+      severity: dbMetadata?.errorCode ? 'error' : 'info',
+      trace_id: traceId,
+      span_id: `db-${Date.now()}`,
+      trace_info: {
+        db_query:
+          config.enableValidation && isValidDbQuery(query)
+            ? query
+            : query.substring(0, 100) + '...',
+        db_duration_ms: durationMs,
+        db_rows_affected: rowsAffected,
+        db_query_type: dbMetadata?.queryType,
+        db_table_name: dbMetadata?.tableName,
+        db_database: dbMetadata?.database,
+        db_rows_examined: dbMetadata?.rowsExamined,
+        db_error_code: dbMetadata?.errorCode,
+        db_error_message: dbMetadata?.errorMessage,
+        db_connection_id: dbMetadata?.connectionId,
+        db_transaction_id: dbMetadata?.transactionId,
+      },
+    }
+
+    if (trace) {
+      trace.dbEvents.push(event)
+    }
+
+    return event
+  }
+
+  const endHttpTrace = (
+    traceId: string,
+    statusCode: number,
+    customFields?: Record<string, unknown>
+  ): LogEvent | null => {
+    const trace = activeTraces.get(traceId)
+    if (!trace) return null
+
+    const duration = Date.now() - trace.startTime
+
+    const event: LogEvent = {
+      event_type: 'http',
+      message: 'HTTP request completed',
+      severity: statusCode >= 400 ? 'error' : 'info',
+      trace_id: traceId,
+      span_id: `http-end-${Date.now()}`,
+      trace_info: {
+        http_status_code:
+          config.enableValidation && isValidHttpStatus(statusCode)
+            ? statusCode
+            : undefined,
+        http_duration_ms: duration,
+        custom_fields: customFields,
+      },
+    }
+
+    activeTraces.delete(traceId)
+    return event
+  }
+
+  const getActiveTraces = (): string[] => Array.from(activeTraces.keys())
+
+  const getTraceData = (traceId: string): TraceData | undefined =>
+    activeTraces.get(traceId)
+
+  return {
+    startHttpTrace,
+    addLog,
+    addDbEvent,
+    endHttpTrace,
+    getActiveTraces,
+    getTraceData,
+  }
+}
+
+// ====== ENHANCED BATCHING SYSTEM ======
+
+// Functional batching system with strict validation
+type BatcherState = {
+  batch: LogEvent[]
+  batchTimer: NodeJS.Timeout | null
+  config: BeaconConfig
+  failedEvents: LogEvent[]
+  validationErrors: Array<{ event: LogEvent; errors: string[] }>
+}
+
+// Pure function to create a new batcher state
+const createBatcherState = (
+  config: BeaconConfig = DEFAULT_CONFIG
+): BatcherState => ({
+  batch: [],
+  batchTimer: null,
+  config,
+  failedEvents: [],
+  validationErrors: [],
+})
+
+// Enhanced retry logic with validation error handling
+const sendWithRetry = async (
+  url: string,
+  options: RequestInit,
+  config: BeaconConfig,
+  retryCount = 0
+): Promise<void> => {
+  try {
+    const response = await fetch(url, options)
+
+    if (response.ok) {
+      return // Success
+    }
+
+    if (response.status === 400) {
+      // Validation error - don't retry, log the error
+      const errorText = await response.text()
+      console.error('Validation error from server:', errorText)
+      return // Don't retry validation errors
+    }
+
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+  } catch (error) {
+    if (retryCount < config.maxRetries) {
+      const delay = config.retryDelay * Math.pow(2, retryCount) // Exponential backoff
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      return sendWithRetry(url, options, config, retryCount + 1)
+    }
+    throw error
+  }
+}
+
+// Pure function to send single log
+const sendSingleLog = async (
+  logEvent: LogEvent,
+  config: BeaconConfig
+): Promise<void> => {
+  await sendWithRetry(
+    `${config.baseUrl}/logs`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(logEvent),
+    },
+    config
+  )
+}
+
+// Pure function to send batch logs
+const sendBatchLogs = async (
+  logEvents: LogEvent[],
+  config: BeaconConfig
+): Promise<void> => {
+  await sendWithRetry(
+    `${config.baseUrl}/logs/batch`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(logEvents),
+    },
+    config
+  )
+}
+
+// Enhanced flush function with strict validation
+const flushLogs = async (state: BatcherState): Promise<BatcherState> => {
+  if (state.batch.length === 0) return state
+
+  const currentBatch = [...state.batch]
+  const newState: BatcherState = {
+    ...state,
+    batch: [],
+    batchTimer: null,
+  }
+
+  if (state.batchTimer) {
+    clearTimeout(state.batchTimer)
+  }
+
+  // MANDATORY validation to prevent server batch failures
+  const validEvents: LogEvent[] = []
+  const invalidEvents: Array<{ event: LogEvent; errors: string[] }> = []
+
+  if (state.config.enableValidation) {
+    for (const event of currentBatch) {
+      const validation = validateLogEvent(event)
+      if (validation.isValid) {
+        validEvents.push(event)
+      } else {
+        invalidEvents.push({ event, errors: validation.errors })
+        console.warn(
+          'Invalid event dropped:',
+          event,
+          'Errors:',
+          validation.errors
+        )
+      }
+    }
+
+    newState.validationErrors = [...newState.validationErrors, ...invalidEvents]
+  } else {
+    validEvents.push(...currentBatch)
+  }
+
+  if (validEvents.length === 0) {
+    return newState // No valid events to send
+  }
+
+  try {
+    if (validEvents.length === 1) {
+      await sendSingleLog(validEvents[0], state.config)
+    } else {
+      await sendBatchLogs(validEvents, state.config)
+    }
+  } catch (error) {
+    console.error('Failed to send logs to Beacon Server:', error)
+    newState.failedEvents = [...newState.failedEvents, ...validEvents]
+  }
+
+  return newState
+}
+
+// High-performance functional batcher optimized for 5k+ req/min
+export const createLogBatcher = (config: BeaconConfig = DEFAULT_CONFIG) => {
+  let state = createBatcherState(config)
+
+  const addLog = async (logEvent: LogEvent): Promise<void> => {
+    // Add timestamp if not provided
+    const normalizedEvent: LogEvent = {
+      ...logEvent,
+      timestamp: logEvent.timestamp || new Date().toISOString(),
+      severity: logEvent.severity || 'info', // Default severity
+    }
+
+    state = {
+      ...state,
+      batch: [...state.batch, normalizedEvent],
+    }
+
+    if (state.batch.length >= state.config.batchSize) {
+      state = await flushLogs(state)
+    } else if (!state.batchTimer) {
+      state = {
+        ...state,
+        batchTimer: setTimeout(async () => {
+          state = await flushLogs(state)
+        }, state.config.batchTimeout),
+      }
+    }
+  }
+
+  const flush = async (): Promise<void> => {
+    state = await flushLogs(state)
+  }
+
+  const shutdown = async (): Promise<void> => {
+    await flush()
+  }
+
+  const getStats = () => ({
+    batchSize: state.batch.length,
+    failedEvents: state.failedEvents.length,
+    validationErrors: state.validationErrors.length,
+    config: state.config,
+  })
+
+  const getFailedEvents = () => [...state.failedEvents]
+
+  const getValidationErrors = () => [...state.validationErrors]
+
+  const clearFailedEvents = () => {
+    state = { ...state, failedEvents: [] }
+  }
+
+  // Return object with methods (functional approach)
+  return {
+    addLog,
+    flush,
+    shutdown,
+    getStats,
+    getFailedEvents,
+    getValidationErrors,
+    clearFailedEvents,
+    // Getter for current state (for debugging/testing)
+    getState: () => ({
+      ...state,
+      batch: [...state.batch],
+      failedEvents: [...state.failedEvents],
+      validationErrors: [...state.validationErrors],
+    }),
+  }
+}
+
+// Create global batcher instance using functional approach
+const globalBatcher = createLogBatcher()
+
+// Create global trace manager
+const globalTraceManager = createTraceManager()
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  await globalBatcher.shutdown()
+})
+
+process.on('SIGINT', async () => {
+  await globalBatcher.shutdown()
+})
+
+// ====== PUBLIC API ======
+
+export const sendLog = async (logEvent: LogEvent): Promise<void> => {
+  await globalBatcher.addLog(logEvent)
+}
+
+export const runInSpan = async (
+  cb: () => Promise<unknown>
+): Promise<unknown> => {
+  return executionContext.run(
     {
       traceId: executionContext.getStore()?.traceId || randomUUID(),
-      parentSpanId: executionContext.getStore()?.spanId || randomUUID(),
+      parentSpanId: executionContext.getStore()?.spanId,
       spanId: randomUUID(),
     },
     cb
   )
 }
 
+// Enhanced logging functions with trace support
+const createLogEvent = (
+  event_type: LogEvent['event_type'],
+  severity: LogEvent['severity'],
+  message: string,
+  extra: Record<string, unknown> = {}
+): LogEvent => {
+  const { duration_ms, trace_info, ...customFields } = extra
+  const durationMs = typeof duration_ms === 'number' ? duration_ms : undefined
+
+  return {
+    event_type,
+    severity,
+    message,
+    trace_id: executionContext.getStore()?.traceId,
+    span_id: executionContext.getStore()?.spanId,
+    parent_span_id: executionContext.getStore()?.parentSpanId,
+    trace_info: {
+      ...(trace_info as TraceInfo),
+      ...(durationMs && { http_duration_ms: Math.round(durationMs) }),
+      ...(Object.keys(customFields).length > 0 && {
+        custom_fields: customFields,
+      }),
+    },
+  }
+}
+
 export const logInfo = (
   message: string,
   extra: Record<string, unknown> = {}
-) => {
-  const { duration_ms, ...attributes } = extra
-  sendLog({
-    timestamp: new Date().toISOString(),
-    severity: 'INFO',
-    message,
-    duration_ms: Math.round(duration_ms || 0),
-    trace_id: executionContext.getStore()?.traceId || randomUUID(),
-    span_id: executionContext.getStore()?.spanId || randomUUID(),
-    parent_span_id: executionContext.getStore()?.parentSpanId,
-    attributes,
-  })
+): void => {
+  sendLog(createLogEvent('log', 'info', message, extra))
 }
+
 export const logWarn = (
   message: string,
   extra: Record<string, unknown> = {}
-) => {
-  const { duration_ms, ...attributes } = extra
-  sendLog({
-    timestamp: new Date().toISOString(),
-    severity: 'WARN',
-    message,
-    duration_ms: Math.round(duration_ms || 0),
-    trace_id: executionContext.getStore()?.traceId || randomUUID(),
-    span_id: executionContext.getStore()?.spanId || randomUUID(),
-    parent_span_id: executionContext.getStore()?.parentSpanId,
-    attributes,
-  })
+): void => {
+  sendLog(createLogEvent('log', 'warn', message, extra))
 }
+
 export const logError = (
   message: string,
   extra: Record<string, unknown> = {}
-) => {
-  const { duration_ms, ...attributes } = extra
-  sendLog({
-    timestamp: new Date().toISOString(),
-    severity: 'ERROR',
-    message,
-    duration_ms: Math.round(duration_ms || 0),
-    trace_id: executionContext.getStore()?.traceId || randomUUID(),
-    span_id: executionContext.getStore()?.spanId || randomUUID(),
-    parent_span_id: executionContext.getStore()?.parentSpanId,
-    attributes,
-  })
+): void => {
+  sendLog(createLogEvent('log', 'error', message, extra))
 }
 
-export interface MyPluginOptions {
-  onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void // Callback to be called on request
-  onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void // Callback to be called on reply
+export const logDebug = (
+  message: string,
+  extra: Record<string, unknown> = {}
+): void => {
+  sendLog(createLogEvent('log', 'debug', message, extra))
+}
+
+export const logFatal = (
+  message: string,
+  extra: Record<string, unknown> = {}
+): void => {
+  sendLog(createLogEvent('log', 'fatal', message, extra))
+}
+
+// Enhanced DB logging function with comprehensive metadata support
+export const logDbOperation = (
+  query: string,
+  durationMs: number,
+  rowsAffected?: number,
+  metadata?: {
+    queryType?: string
+    tableName?: string
+    database?: string
+    rowsExamined?: number
+    errorCode?: string
+    errorMessage?: string
+    connectionId?: string
+    transactionId?: string
+  },
+  extra: Record<string, unknown> = {}
+): void => {
+  const event: LogEvent = {
+    event_type: 'db',
+    severity: metadata?.errorCode ? 'error' : 'info',
+    message: metadata?.errorCode
+      ? 'Database operation failed'
+      : 'Database operation completed',
+    trace_id: executionContext.getStore()?.traceId,
+    span_id: executionContext.getStore()?.spanId,
+    parent_span_id: executionContext.getStore()?.parentSpanId,
+    trace_info: {
+      db_query: query,
+      db_duration_ms: durationMs,
+      db_rows_affected: rowsAffected,
+      db_query_type: metadata?.queryType,
+      db_table_name: metadata?.tableName,
+      db_database: metadata?.database,
+      db_rows_examined: metadata?.rowsExamined,
+      db_error_code: metadata?.errorCode,
+      db_error_message: metadata?.errorMessage,
+      db_connection_id: metadata?.connectionId,
+      db_transaction_id: metadata?.transactionId,
+      custom_fields: Object.keys(extra).length > 0 ? extra : undefined,
+    },
+  }
+  sendLog(event)
+}
+
+// Trace management API
+export const startHttpTrace = (
+  traceId: string,
+  method: string,
+  path: string,
+  userAgent?: string,
+  remoteIP?: string
+): void => {
+  const event = globalTraceManager.startHttpTrace(
+    traceId,
+    method,
+    path,
+    userAgent,
+    remoteIP
+  )
+  sendLog(event)
+}
+
+export const addTraceLog = (
+  traceId: string,
+  message: string,
+  severity: LogEvent['severity'] = 'info',
+  customFields?: Record<string, unknown>
+): void => {
+  const event = globalTraceManager.addLog(
+    traceId,
+    message,
+    severity,
+    customFields
+  )
+  sendLog(event)
+}
+
+// Enhanced database event with comprehensive metadata
+export const addTraceDbEvent = (
+  traceId: string,
+  query: string,
+  durationMs: number,
+  rowsAffected?: number,
+  metadata?: {
+    queryType?: string
+    tableName?: string
+    database?: string
+    rowsExamined?: number
+    errorCode?: string
+    errorMessage?: string
+    connectionId?: string
+    transactionId?: string
+  }
+): void => {
+  const event = globalTraceManager.addDbEvent(
+    traceId,
+    query,
+    durationMs,
+    rowsAffected,
+    metadata
+  )
+  sendLog(event)
+}
+
+export const endHttpTrace = (
+  traceId: string,
+  statusCode: number,
+  customFields?: Record<string, unknown>
+): void => {
+  const event = globalTraceManager.endHttpTrace(
+    traceId,
+    statusCode,
+    customFields
+  )
+  if (event) {
+    sendLog(event)
+  }
+}
+
+// Extended Fastify types
+declare module 'fastify' {
+  interface FastifyRequest {
+    logContext: {
+      traceId: string
+      spanId: string
+      start: bigint
+      logs: unknown[]
+    }
+    _logContext?: {
+      traceId: string
+      spanId: string
+      start: bigint
+      logs: unknown[]
+    }
+    onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void
+  }
+
+  interface FastifyReply {
+    onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void
+  }
+}
+
+export type MyPluginOptions = {
+  onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void
+  onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void
+  enableTraceLifecycle?: boolean
 }
 
 const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
   fastify,
   options
 ) => {
-  fastify.decorateRequest('logContext', 'super_secret_value')
+  fastify.decorateRequest('logContext', {
+    getter() {
+      return (
+        (this as FastifyRequest)._logContext || {
+          traceId: '',
+          spanId: '',
+          start: BigInt(0),
+          logs: [],
+        }
+      )
+    },
+    setter(value) {
+      // Store the value on the request object
+      ;(this as FastifyRequest)._logContext = value
+    },
+  })
   fastify.decorateRequest('onRequestCallback', options.onRequestCallback)
   fastify.decorateReply('onReplyCallback', options.onReplyCallback)
 
   fastify.addHook('preHandler', (request, _reply, next) => {
-    // Use executionContext to
-    const { traceId, spanId } = request.logContext
-    // console.log(traceId, spanId, 'request.logContext')
+    const { traceId, spanId } = request.logContext || {
+      traceId: randomUUID(),
+      spanId: randomUUID(),
+    }
     executionContext.run({ traceId, spanId }, next)
   })
+
   fastify.addHook('onRequest', async (req, reply) => {
-    // console.log(
-    //   `Received request: ${req.method} ${
-    //     req.url
-    //   } at ${new Date().toISOString()}`
-    // )
-    // console.log(executionContext.getStore(), 'executionContext.getStore()')
     const traceId = executionContext.getStore()?.traceId || randomUUID()
     const spanId = executionContext.getStore()?.spanId || randomUUID()
     const start = process.hrtime.bigint()
@@ -146,45 +922,95 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
       traceId,
       spanId,
       start,
-      logs: [] as unknown[],
+      logs: [],
     }
 
-    sendLog({
-      timestamp: new Date().toISOString(),
-      severity: 'INFO',
-      message: `Request to ${req.method} ${req.url.split('?')[0]}`,
-      trace_id: traceId,
-      span_id: spanId,
-      attributes: {
-        statusCode: reply.statusCode.toString(),
-        method: req.method,
-        url: req.url,
-        path: req.params?.path || '',
-      },
-    })
-    req.onRequestCallback?.call(req, req, reply)
+    // Enhanced HTTP trace logging
+    if (options.enableTraceLifecycle) {
+      startHttpTrace(
+        traceId,
+        req.method,
+        req.url.split('?')[0],
+        req.headers['user-agent'],
+        req.ip
+      )
+    } else {
+      await sendLog({
+        event_type: 'http',
+        severity: 'info',
+        message: `Request to ${req.method} ${req.url.split('?')[0]}`,
+        trace_id: traceId,
+        span_id: spanId,
+        trace_info: {
+          http_method: req.method,
+          http_path: req.url.split('?')[0],
+          http_user_agent: req.headers['user-agent'] || '',
+          http_remote_ip: req.ip && isValidIP(req.ip) ? req.ip : undefined,
+        },
+      })
+    }
+
+    req.onRequestCallback?.(req, reply)
   })
 
   fastify.addHook('onResponse', async (req, reply) => {
     const { traceId, spanId, start } = req.logContext || {}
+    if (!traceId || !spanId || !start) return
+
     const durationMs = Number(process.hrtime.bigint() - start) / 1e6
-    // Send logs to your logging backend
-    sendLog({
-      timestamp: new Date().toISOString(),
-      severity: 'INFO',
-      message: `Request to ${req.method} ${req.url.split('?')[0]} completed`,
-      trace_id: traceId,
-      span_id: spanId,
-      duration_ms: Math.round(durationMs),
-      attributes: {
-        statusCode: reply.statusCode.toString(),
-        method: req.method,
+
+    // Enhanced HTTP trace completion
+    if (options.enableTraceLifecycle) {
+      endHttpTrace(traceId, reply.statusCode, {
+        responseTime: `${durationMs.toFixed(2)}ms`,
         url: req.url,
-        path: req.params?.path || '',
-      },
-    })
-    reply.onReplyCallback?.call(req, req, reply)
+      })
+    } else {
+      await sendLog({
+        event_type: 'http',
+        severity: reply.statusCode >= 400 ? 'error' : 'info',
+        message: `Request to ${req.method} ${req.url.split('?')[0]} completed`,
+        trace_id: traceId,
+        span_id: spanId,
+        trace_info: {
+          http_method: req.method,
+          http_path: req.url.split('?')[0],
+          http_status_code: reply.statusCode,
+          http_duration_ms: Math.round(durationMs),
+        },
+      })
+    }
+
+    reply.onReplyCallback?.(req, reply)
   })
 }
 
 export const loggerPlugin = fp(myPluginAsync, {})
+
+// Health check and utility functions - enhanced with validation
+export const checkBeaconHealth = async (
+  baseUrl = DEFAULT_CONFIG.baseUrl
+): Promise<boolean> => {
+  try {
+    const response = await fetch(`${baseUrl}/health`)
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+export const getBeaconStats = async (
+  baseUrl = DEFAULT_CONFIG.baseUrl
+): Promise<Record<string, unknown> | null> => {
+  try {
+    const response = await fetch(`${baseUrl}/logs/stats`)
+    if (response.ok) {
+      return (await response.json()) as Record<string, unknown>
+    }
+  } catch (error) {
+    console.error('Failed to get Beacon stats:', error)
+  }
+  return null
+}
+
+// All functions are exported individually above
