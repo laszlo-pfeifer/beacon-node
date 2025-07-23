@@ -272,6 +272,7 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
 
   const startHttpTrace = (
     traceId: string,
+    spanId: string,
     method: string,
     path: string,
     userAgent?: string,
@@ -284,18 +285,15 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
 
     const event: LogEvent = {
       event_type: 'http',
-      message: 'HTTP request started',
+      message: `${method} ${path} - HTTP request started`,
       severity: 'info',
       trace_id: traceId,
-      span_id: `http-start-${Date.now()}`,
+      span_id: spanId,
       trace_info: {
         http_method: method,
         http_path: path,
         http_user_agent: userAgent,
-        http_remote_ip:
-          config.enableValidation && remoteIP && isValidIP(remoteIP)
-            ? remoteIP
-            : undefined,
+        http_remote_ip: remoteIP && isValidIP(remoteIP) ? remoteIP : undefined,
       },
     }
 
@@ -380,26 +378,28 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
 
   const endHttpTrace = (
     traceId: string,
+    spanId: string,
     statusCode: number,
+    durationMs: number,
     customFields?: Record<string, unknown>
   ): LogEvent | null => {
     const trace = activeTraces.get(traceId)
     if (!trace) return null
 
-    const duration = Date.now() - trace.startTime
+    const method = trace.method || 'UNKNOWN'
+    const path = trace.path || 'UNKNOWN'
 
     const event: LogEvent = {
       event_type: 'http',
-      message: 'HTTP request completed',
-      severity: statusCode >= 400 ? 'error' : 'info',
+      message: `${method} ${path} - HTTP request completed`,
+      severity: 'info',
       trace_id: traceId,
-      span_id: `http-end-${Date.now()}`,
+      span_id: spanId,
       trace_info: {
-        http_status_code:
-          config.enableValidation && isValidHttpStatus(statusCode)
-            ? statusCode
-            : undefined,
-        http_duration_ms: duration,
+        http_status_code: isValidHttpStatus(statusCode)
+          ? statusCode
+          : undefined,
+        http_duration_ms: Math.round(durationMs),
         custom_fields: customFields,
       },
     }
@@ -781,6 +781,7 @@ export const logDbOperation = (
 // Trace management API
 export const startHttpTrace = (
   traceId: string,
+  spanId: string,
   method: string,
   path: string,
   userAgent?: string,
@@ -788,6 +789,7 @@ export const startHttpTrace = (
 ): void => {
   const event = globalTraceManager.startHttpTrace(
     traceId,
+    spanId,
     method,
     path,
     userAgent,
@@ -840,12 +842,16 @@ export const addTraceDbEvent = (
 
 export const endHttpTrace = (
   traceId: string,
+  spanId: string,
   statusCode: number,
+  durationMs: number,
   customFields?: Record<string, unknown>
 ): void => {
   const event = globalTraceManager.endHttpTrace(
     traceId,
+    spanId,
     statusCode,
+    durationMs,
     customFields
   )
   if (event) {
@@ -879,7 +885,6 @@ declare module 'fastify' {
 export type MyPluginOptions = {
   onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void
   onReplyCallback?: (request: FastifyRequest, reply: FastifyReply) => void
-  enableTraceLifecycle?: boolean
 }
 
 const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
@@ -905,17 +910,9 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
   fastify.decorateRequest('onRequestCallback', options.onRequestCallback)
   fastify.decorateReply('onReplyCallback', options.onReplyCallback)
 
-  fastify.addHook('preHandler', (request, _reply, next) => {
-    const { traceId, spanId } = request.logContext || {
-      traceId: randomUUID(),
-      spanId: randomUUID(),
-    }
-    executionContext.run({ traceId, spanId }, next)
-  })
-
   fastify.addHook('onRequest', async (req, reply) => {
-    const traceId = executionContext.getStore()?.traceId || randomUUID()
-    const spanId = executionContext.getStore()?.spanId || randomUUID()
+    const traceId = randomUUID()
+    const spanId = randomUUID()
     const start = process.hrtime.bigint()
 
     req.logContext = {
@@ -925,32 +922,25 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
       logs: [],
     }
 
-    // Enhanced HTTP trace logging
-    if (options.enableTraceLifecycle) {
-      startHttpTrace(
-        traceId,
-        req.method,
-        req.url.split('?')[0],
-        req.headers['user-agent'],
-        req.ip
-      )
-    } else {
-      await sendLog({
-        event_type: 'http',
-        severity: 'info',
-        message: `Request to ${req.method} ${req.url.split('?')[0]}`,
-        trace_id: traceId,
-        span_id: spanId,
-        trace_info: {
-          http_method: req.method,
-          http_path: req.url.split('?')[0],
-          http_user_agent: req.headers['user-agent'] || '',
-          http_remote_ip: req.ip && isValidIP(req.ip) ? req.ip : undefined,
-        },
-      })
-    }
+    // Always use enhanced HTTP trace logging
+    startHttpTrace(
+      traceId,
+      spanId,
+      req.method,
+      req.url.split('?')[0],
+      req.headers['user-agent'],
+      req.ip
+    )
 
     req.onRequestCallback?.(req, reply)
+  })
+
+  fastify.addHook('preHandler', (request, _reply, next) => {
+    const { traceId, spanId } = request.logContext || {
+      traceId: randomUUID(),
+      spanId: randomUUID(),
+    }
+    executionContext.run({ traceId, spanId }, next)
   })
 
   fastify.addHook('onResponse', async (req, reply) => {
@@ -959,27 +949,11 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
 
     const durationMs = Number(process.hrtime.bigint() - start) / 1e6
 
-    // Enhanced HTTP trace completion
-    if (options.enableTraceLifecycle) {
-      endHttpTrace(traceId, reply.statusCode, {
-        responseTime: `${durationMs.toFixed(2)}ms`,
-        url: req.url,
-      })
-    } else {
-      await sendLog({
-        event_type: 'http',
-        severity: reply.statusCode >= 400 ? 'error' : 'info',
-        message: `Request to ${req.method} ${req.url.split('?')[0]} completed`,
-        trace_id: traceId,
-        span_id: spanId,
-        trace_info: {
-          http_method: req.method,
-          http_path: req.url.split('?')[0],
-          http_status_code: reply.statusCode,
-          http_duration_ms: Math.round(durationMs),
-        },
-      })
-    }
+    // Always use enhanced HTTP trace completion
+    endHttpTrace(traceId, spanId, reply.statusCode, durationMs, {
+      responseTime: `${durationMs.toFixed(2)}ms`,
+      url: req.url,
+    })
 
     reply.onReplyCallback?.(req, reply)
   })

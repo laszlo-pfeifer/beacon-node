@@ -460,13 +460,14 @@ describe('Enhanced Beacon Server Integration', () => {
       // Start HTTP trace
       const startEvent = traceManager.startHttpTrace(
         traceId,
+        'span-123',
         'POST',
         '/api/users',
         'test-agent',
         '192.168.1.1'
       )
       expect(startEvent.event_type).toBe('http')
-      expect(startEvent.message).toBe('HTTP request started')
+      expect(startEvent.message).toBe('POST /api/users - HTTP request started')
       expect(startEvent.trace_info?.http_method).toBe('POST')
       expect(startEvent.trace_info?.http_remote_ip).toBe('192.168.1.1')
 
@@ -533,10 +534,17 @@ describe('Enhanced Beacon Server Integration', () => {
       expect(activeTraces).toContain(traceId)
 
       // End HTTP trace
-      const endEvent = traceManager.endHttpTrace(traceId, 201, { userId: 123 })
+      const endEvent = traceManager.endHttpTrace(
+        traceId,
+        'span-123',
+        201,
+        150.5,
+        { userId: 123 }
+      )
       expect(endEvent?.event_type).toBe('http')
-      expect(endEvent?.message).toBe('HTTP request completed')
+      expect(endEvent?.message).toBe('POST /api/users - HTTP request completed')
       expect(endEvent?.trace_info?.http_status_code).toBe(201)
+      expect(endEvent?.trace_info?.http_duration_ms).toBe(151) // Rounded
       expect(endEvent?.trace_info?.custom_fields?.userId).toBe(123)
 
       // Trace should be removed
@@ -548,6 +556,7 @@ describe('Enhanced Beacon Server Integration', () => {
       const traceManager = createTraceManager()
       const event = traceManager.startHttpTrace(
         'test-trace',
+        'span-456',
         'GET',
         '/api/test',
         'agent',
@@ -697,6 +706,7 @@ describe('Enhanced Beacon Server Integration', () => {
       expect(() =>
         startHttpTrace(
           traceId,
+          'span-api-put-123',
           'PUT',
           '/api/users/123',
           'test-agent-v2.0',
@@ -745,7 +755,7 @@ describe('Enhanced Beacon Server Integration', () => {
       ).not.toThrow()
 
       expect(() =>
-        endHttpTrace(traceId, 200, {
+        endHttpTrace(traceId, 'span-api-put-123', 200, 125.3, {
           user_updated: true,
           total_db_time: 40,
           cache_invalidated: ['user_123', 'user_email_index'],
