@@ -69,6 +69,7 @@ export type BeaconBatchResponse = BeaconResponse & {
 // Configuration for the beacon client - optimized for 5k+ req/min
 type BeaconConfig = {
   baseUrl: string
+  sendEnabled: boolean
   batchSize: number
   batchTimeout: number
   maxRetries: number
@@ -78,6 +79,9 @@ type BeaconConfig = {
 
 const DEFAULT_CONFIG: BeaconConfig = {
   baseUrl: process.env['BEACON_URL'] || 'http://localhost:8085',
+  sendEnabled:
+    !!process.env['BEACON_URL'] &&
+    process.env['BEACON_ENABLED']?.toLowerCase() !== 'false',
   batchSize: 50, // Optimized for 5k+ req/min performance
   batchTimeout: 5000, // 5 seconds auto-flush as required
   maxRetries: 3,
@@ -532,6 +536,9 @@ const sendSingleLog = async (
   logEvent: LogEvent,
   config: BeaconConfig
 ): Promise<void> => {
+  if (!config.sendEnabled) {
+    return
+  }
   await sendWithRetry(
     `${config.baseUrl}/logs`,
     {
@@ -548,6 +555,9 @@ const sendBatchLogs = async (
   logEvents: LogEvent[],
   config: BeaconConfig
 ): Promise<void> => {
+  if (!config.sendEnabled) {
+    return
+  }
   await sendWithRetry(
     `${config.baseUrl}/logs/batch`,
     {
@@ -560,26 +570,24 @@ const sendBatchLogs = async (
 }
 
 // Enhanced flush function with strict validation
-const flushLogs = async (state: BatcherState): Promise<BatcherState> => {
-  if (state.batch.length === 0) return state
-
-  const currentBatch = [...state.batch]
-  const newState: BatcherState = {
-    ...state,
-    batch: [],
-    batchTimer: null,
+const flushLogs = async (
+  batch: LogEvent[],
+  config: BeaconConfig
+): Promise<void> => {
+  if (batch.length === 0) {
+    return
   }
 
-  if (state.batchTimer) {
-    clearTimeout(state.batchTimer)
-  }
+  // if (state.batchTimer) {
+  //   clearTimeout(state.batchTimer)
+  // }
 
   // MANDATORY validation to prevent server batch failures
   const validEvents: LogEvent[] = []
   const invalidEvents: Array<{ event: LogEvent; errors: string[] }> = []
 
-  if (state.config.enableValidation) {
-    for (const event of currentBatch) {
+  if (config.enableValidation) {
+    for (const event of batch) {
       const validation = validateLogEvent(event)
       if (validation.isValid) {
         validEvents.push(event)
@@ -593,33 +601,30 @@ const flushLogs = async (state: BatcherState): Promise<BatcherState> => {
         )
       }
     }
-
-    newState.validationErrors = [...newState.validationErrors, ...invalidEvents]
   } else {
-    validEvents.push(...currentBatch)
+    validEvents.push(...batch)
   }
 
   if (validEvents.length === 0) {
-    return newState // No valid events to send
+    return // No valid events to send
   }
-
   try {
     if (validEvents.length === 1) {
-      await sendSingleLog(validEvents[0], state.config)
+      await sendSingleLog(validEvents[0], config)
     } else {
-      await sendBatchLogs(validEvents, state.config)
+      await sendBatchLogs(validEvents, config)
     }
   } catch (error) {
     console.error('Failed to send logs to Beacon Server:', error)
-    newState.failedEvents = [...newState.failedEvents, ...validEvents]
   }
-
-  return newState
 }
 
 // High-performance functional batcher optimized for 5k+ req/min
 export const createLogBatcher = (config: BeaconConfig = DEFAULT_CONFIG) => {
   let state = createBatcherState(config)
+
+  let buffer: LogEvent[] = []
+  let batchTimer: NodeJS.Timeout | null
 
   const addLog = async (logEvent: LogEvent): Promise<void> => {
     // Add timestamp if not provided
@@ -634,20 +639,25 @@ export const createLogBatcher = (config: BeaconConfig = DEFAULT_CONFIG) => {
       batch: [...state.batch, normalizedEvent],
     }
 
-    if (state.batch.length >= state.config.batchSize) {
-      state = await flushLogs(state)
-    } else if (!state.batchTimer) {
-      state = {
-        ...state,
-        batchTimer: setTimeout(async () => {
-          state = await flushLogs(state)
-        }, state.config.batchTimeout),
-      }
+    buffer.push(normalizedEvent)
+
+    if (buffer.length >= config.batchSize) {
+      await flush()
+    } else if (!batchTimer) {
+      batchTimer = setTimeout(async () => {
+        await flush()
+      }, config.batchTimeout)
     }
   }
 
   const flush = async (): Promise<void> => {
-    state = await flushLogs(state)
+    if (batchTimer) {
+      clearTimeout(batchTimer)
+      batchTimer = null
+    }
+    const batch = [...buffer]
+    buffer = []
+    await flushLogs(batch, config)
   }
 
   const shutdown = async (): Promise<void> => {

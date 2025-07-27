@@ -589,6 +589,7 @@ describe('Enhanced Beacon Server Integration', () => {
     test('should create batcher with enhanced config', () => {
       const customConfig = {
         baseUrl: 'http://localhost:8085',
+        sendEnabled: true,
         batchSize: 50,
         batchTimeout: 5000,
         maxRetries: 3,
@@ -611,6 +612,7 @@ describe('Enhanced Beacon Server Integration', () => {
     test('should validate events before batching', async () => {
       const batcher = createLogBatcher({
         baseUrl: 'http://localhost:8085',
+        sendEnabled: true,
         batchSize: 5,
         batchTimeout: 100,
         maxRetries: 1,
@@ -618,26 +620,39 @@ describe('Enhanced Beacon Server Integration', () => {
         enableValidation: true,
       })
 
-      // Add valid event
-      await batcher.addLog({
-        event_type: 'log',
-        message: 'Valid event',
-      })
+      // Mock console.warn to capture validation warnings
+      const originalConsoleWarn = console.warn
+      let warningCaptured = false
+      let warningMessage = ''
 
-      // Add invalid event
-      await batcher.addLog({
-        event_type: 'invalid' as unknown,
-        message: 'Invalid event',
-      } as LogEvent)
+      console.warn = (...args) => {
+        warningCaptured = true
+        warningMessage = args.join(' ')
+      }
 
-      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      try {
+        // Add valid event
+        await batcher.addLog({
+          event_type: 'log',
+          message: 'Valid event',
+        })
 
-      const errors = batcher.getValidationErrors()
+        // Add invalid event
+        await batcher.addLog({
+          event_type: 'invalid' as unknown,
+          message: 'Invalid event',
+        } as LogEvent)
 
-      expect(errors.length).toBeGreaterThan(0)
-      expect(errors[0].errors).toContain(
-        'event_type must be one of: log, http, db'
-      )
+        await new Promise<void>((resolve) => setTimeout(resolve, 200))
+
+        // Validation error should be logged to console
+        expect(warningCaptured).toBe(true)
+        expect(warningMessage).toContain(
+          'event_type must be one of: log, http, db'
+        )
+      } finally {
+        console.warn = originalConsoleWarn
+      }
 
       await batcher.shutdown()
     })
@@ -645,6 +660,7 @@ describe('Enhanced Beacon Server Integration', () => {
     test('should add default severity and timestamp', async () => {
       const batcher = createLogBatcher({
         baseUrl: 'http://localhost:8085',
+        sendEnabled: true,
         batchSize: 100,
         batchTimeout: 1000,
         maxRetries: 1,
@@ -939,6 +955,7 @@ describe('Error Handling', () => {
   test('should handle enhanced batcher network failures gracefully', async () => {
     const batcher = createLogBatcher({
       baseUrl: 'http://localhost:8085',
+      sendEnabled: true,
       batchSize: 1, // Force immediate flush
       batchTimeout: 1000,
       maxRetries: 1, // Reduce retries for faster test
@@ -946,21 +963,38 @@ describe('Error Handling', () => {
       enableValidation: false,
     })
 
-    // This should not throw despite network error
-    await expect(
-      batcher.addLog({
-        event_type: 'log',
-        severity: 'error',
-        message: 'Test network failure',
-        trace_info: {
-          custom_fields: { test: 'network_failure' },
-        },
-      })
-    ).resolves.toBeUndefined()
+    // Mock console.error to capture network failure logs
+    const originalConsoleError = console.error
+    let errorCaptured = false
+    let errorMessage = ''
 
-    // Should track the failed event
-    const failedEvents = batcher.getFailedEvents()
-    expect(failedEvents.length).toBe(1)
+    console.error = (...args) => {
+      errorCaptured = true
+      errorMessage = args.join(' ')
+    }
+
+    try {
+      // This should not throw despite network error
+      await expect(
+        batcher.addLog({
+          event_type: 'log',
+          severity: 'error',
+          message: 'Test network failure',
+          trace_info: {
+            custom_fields: { test: 'network_failure' },
+          },
+        })
+      ).resolves.toBeUndefined()
+
+      // Wait for async operations
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      // Network failure should be logged to console
+      expect(errorCaptured).toBe(true)
+      expect(errorMessage).toContain('Failed to send logs to Beacon Server')
+    } finally {
+      console.error = originalConsoleError
+    }
 
     await batcher.shutdown()
   })
@@ -981,6 +1015,7 @@ describe('Server Validation Error Handling', () => {
   test('should handle validation errors in server response', async () => {
     const batcher = createLogBatcher({
       baseUrl: 'http://localhost:8085',
+      sendEnabled: true,
       batchSize: 1,
       batchTimeout: 1000,
       maxRetries: 3,
