@@ -639,15 +639,16 @@ export const createLogBatcher = (config: BeaconConfig = DEFAULT_CONFIG) => {
       batch: [...state.batch, normalizedEvent],
     }
 
-    buffer.push(normalizedEvent)
+    // buffer.push(normalizedEvent)
+    sendSingleLog(normalizedEvent, config)
 
-    if (buffer.length >= config.batchSize) {
-      await flush()
-    } else if (!batchTimer) {
-      batchTimer = setTimeout(async () => {
-        await flush()
-      }, config.batchTimeout)
-    }
+    // if (buffer.length >= config.batchSize) {
+    //   await flush()
+    // } else if (!batchTimer) {
+    //   batchTimer = setTimeout(async () => {
+    //     await flush()
+    //   }, config.batchTimeout)
+    // }
   }
 
   const flush = async (): Promise<void> => {
