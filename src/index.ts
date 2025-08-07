@@ -7,6 +7,7 @@ import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 export const executionContext = new AsyncLocalStorage<{
   traceId: string
   spanId: string
+  logCount: number
   parentSpanId?: string
 }>()
 
@@ -19,6 +20,9 @@ export type TraceInfo = {
   http_duration_ms?: number
   http_user_agent?: string
   http_remote_ip?: string // MUST be valid IP format
+  http_finished?: boolean // Whether the HTTP request has finished
+
+  log_count?: number // Number of logs in the trace
 
   // Database fields - EXPANDED for comprehensive tracking
   db_query?: string
@@ -48,6 +52,7 @@ export type LogEvent = {
   trace_id?: string // Optional
   span_id?: string // Optional
   parent_span_id?: string // Optional
+  order_in_trace?: number // Optional
 
   // NEW: Enhanced trace information (stored in traces table)
   trace_info?: TraceInfo // Optional
@@ -312,12 +317,19 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
   ): LogEvent => {
     const trace = activeTraces.get(traceId)
 
+    const store = executionContext.getStore()
+    if (store) {
+      // Increment the log count for this trace
+      store.logCount += 1
+    }
+
     const event: LogEvent = {
       event_type: 'log',
       message,
       severity,
       trace_id: traceId,
       span_id: `log-${Date.now()}`,
+      order_in_trace: store?.logCount,
       trace_info: customFields ? { custom_fields: customFields } : undefined,
     }
 
@@ -348,6 +360,11 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
   ): LogEvent => {
     const trace = activeTraces.get(traceId)
 
+    const store = executionContext.getStore()
+    if (store) {
+      // Increment the log count for this trace
+      store.logCount += 1
+    }
     // TODO: Using query in message only works for this test project because it uses tRPC.
     // In production, consider using a more generic message or sanitizing the query.
     const message = dbMetadata?.errorCode
@@ -364,6 +381,7 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
       severity: dbMetadata?.errorCode ? 'error' : 'info',
       trace_id: traceId,
       span_id: spanId,
+      order_in_trace: store?.logCount,
       trace_info: {
         db_query:
           config.enableValidation && isValidDbQuery(query)
@@ -401,17 +419,25 @@ export const createTraceManager = (config: BeaconConfig = DEFAULT_CONFIG) => {
     const method = trace.method || 'UNKNOWN'
     const path = trace.path || 'UNKNOWN'
 
+    const store = executionContext.getStore()
+    if (store) {
+      // Increment the log count for this trace
+      store.logCount += 1
+    }
     const event: LogEvent = {
       event_type: 'http',
       message: `${method} ${path} - HTTP request completed`,
       severity: 'info',
       trace_id: traceId,
       span_id: spanId,
+      order_in_trace: store?.logCount,
       trace_info: {
         http_status_code: isValidHttpStatus(statusCode)
           ? statusCode
           : undefined,
         http_duration_ms: Math.round(durationMs),
+        http_finished: true,
+        log_count: store?.logCount,
       },
     }
 
@@ -737,6 +763,7 @@ export const runInSpan = async (
       traceId: executionContext.getStore()?.traceId || randomUUID(),
       parentSpanId: executionContext.getStore()?.spanId,
       spanId: randomUUID(),
+      logCount: executionContext.getStore()?.logCount || 0,
     },
     cb
   )
@@ -748,13 +775,20 @@ const createLogEvent = (
   severity: LogEvent['severity'],
   message: string
 ): LogEvent => {
+  const store = executionContext.getStore()
+  if (store) {
+    // Increment the log count for this trace
+    store.logCount += 1
+  }
+
   return {
     event_type,
     severity,
     message,
-    trace_id: executionContext.getStore()?.traceId,
-    span_id: executionContext.getStore()?.spanId,
-    parent_span_id: executionContext.getStore()?.parentSpanId,
+    trace_id: store?.traceId,
+    span_id: store?.spanId,
+    parent_span_id: store?.parentSpanId,
+    order_in_trace: store?.logCount,
   }
 }
 
@@ -843,13 +877,20 @@ export const logDbOperation = (
         query.length > 50 ? '...' : ''
       }`
 
+  const store = executionContext.getStore()
+  if (store) {
+    // Increment the log count for this trace
+    store.logCount += 1
+  }
+
   const event: LogEvent = {
     event_type: 'db',
     severity: metadata?.errorCode ? 'error' : 'info',
     message,
-    trace_id: executionContext.getStore()?.traceId,
-    span_id: executionContext.getStore()?.spanId || randomUUID(),
-    parent_span_id: executionContext.getStore()?.parentSpanId,
+    trace_id: store?.traceId,
+    span_id: store?.spanId || randomUUID(),
+    parent_span_id: store?.parentSpanId,
+    order_in_trace: store?.logCount,
     trace_info: {
       db_query: query,
       db_duration_ms: Math.round(durationMs),
@@ -961,6 +1002,11 @@ export const endHttpTrace = (
     durationMs
   )
   if (event) {
+    // Also include log count from execution context if available
+    const store = executionContext.getStore()
+    if (store && event.trace_info) {
+      event.trace_info.log_count = store.logCount
+    }
     sendLog(event)
   }
 }
@@ -972,12 +1018,14 @@ declare module 'fastify' {
       traceId: string
       spanId: string
       start: bigint
+      logCount: number
       logs: unknown[]
     }
     _logContext?: {
       traceId: string
       spanId: string
       start: bigint
+      logCount: number
       logs: unknown[]
     }
     onRequestCallback?: (request: FastifyRequest, reply: FastifyReply) => void
@@ -1005,6 +1053,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
           traceId: '',
           spanId: '',
           start: BigInt(0),
+          logCount: 0,
           logs: [],
         }
       )
@@ -1043,6 +1092,7 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
       traceId,
       spanId,
       start,
+      logCount: 0,
       logs: [],
     }
 
@@ -1063,11 +1113,12 @@ const myPluginAsync: FastifyPluginAsync<MyPluginOptions> = async (
   })
 
   fastify.addHook('preHandler', (request, _reply, next) => {
-    const { traceId, spanId } = request.logContext || {
+    const { traceId, spanId, logCount } = request.logContext || {
       traceId: randomUUID(),
       spanId: randomUUID(),
+      logCount: 0,
     }
-    executionContext.run({ traceId, spanId }, next)
+    executionContext.run({ traceId, spanId, logCount }, next)
   })
 
   fastify.addHook('onResponse', async (req, reply) => {
